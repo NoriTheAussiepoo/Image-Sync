@@ -1,0 +1,9 @@
+bin/
+obj/
+.vs/
+*.user
+*.suo
+config.json
+config.json.*.tmp
+.sync-test/
+.sync-test-csharp/
