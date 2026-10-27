@@ -10,6 +10,7 @@ public partial class MainWindow : Window
     private readonly AppConfigStore _configStore = new();
     private readonly FileSyncService _syncService = new();
     private SourceSelection _sourceSelection = SourceSelection.FileSystem("");
+    private AppConfig? _lastSavedConfig;
     private int _countRefreshVersion;
     private bool _isBusy;
 
@@ -172,12 +173,20 @@ public partial class MainWindow : Window
             _sourceSelection.ToSavedSource(),
             FileSyncService.NormalizeDirectory(DestinationTextBox.Text));
 
+        // Every focus change and the window closing call this; skip the disk write when nothing changed.
+        if (config == _lastSavedConfig)
+        {
+            return;
+        }
+
+        _lastSavedConfig = config;
         try
         {
             await _configStore.SaveAsync(config).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
+            _lastSavedConfig = null;
             if (reportErrors)
             {
                 _ = Dispatcher.BeginInvoke(() => StatusTextBlock.Text = $"Could not save settings: {ex.Message}");

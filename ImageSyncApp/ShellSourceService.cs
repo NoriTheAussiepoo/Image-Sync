@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.IO;
 using System.Windows;
 using System.Windows.Interop;
@@ -8,8 +9,14 @@ public static class ShellSourceService
 {
     // CSIDL_DRIVES is the Windows Shell namespace for "This PC".
     private const int ThisPcShellFolder = 17;
+    private const string ThisPcParsingPath = "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
+    private const int MaximumFolderDepth = 64;
     private static readonly TimeSpan CopyCompletionTimeout = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan CopyStabilityInterval = TimeSpan.FromMilliseconds(500);
+    // When the expected size is known, a matching size plus an exclusive open is strong evidence the copy is done,
+    // so a shorter stability window is enough and saves ~400 ms per copied file.
+    private static readonly TimeSpan KnownSizeStabilityInterval = TimeSpan.FromMilliseconds(100);
+    private static readonly SearchValues<char> InvalidFileNameCharacters = SearchValues.Create(Path.GetInvalidFileNameChars());
 
     [Flags]
     private enum ShellCopyOptions
@@ -64,9 +71,9 @@ public static class ShellSourceService
     public static IEnumerable<ShellSourceFile> EnumerateFiles(object shellFolder) =>
         EnumerateFiles(shellFolder, Array.Empty<string>());
 
-    public static void CopyItemToDirectory(object shellItem, string targetDirectory)
+    public static void CopyItemToDirectory(object shellApplication, object shellItem, string targetDirectory)
     {
-        dynamic shell = CreateShellApplication();
+        dynamic shell = shellApplication;
         dynamic? destinationFolder = shell.NameSpace(targetDirectory);
         if (destinationFolder is null)
         {
@@ -78,6 +85,7 @@ public static class ShellSourceService
 
     public static bool WaitForCopiedFile(string targetPath, long? expectedSize)
     {
+        var pollInterval = expectedSize is null ? CopyStabilityInterval : KnownSizeStabilityInterval;
         var deadline = DateTime.UtcNow + CopyCompletionTimeout;
         long? previousLength = null;
         DateTime previousWriteTime = default;
@@ -99,7 +107,7 @@ public static class ShellSourceService
                 previousWriteTime = info.LastWriteTimeUtc;
             }
 
-            Thread.Sleep(CopyStabilityInterval);
+            Thread.Sleep(pollInterval);
         }
 
         return false;
@@ -114,15 +122,17 @@ public static class ShellSourceService
         for (var index = 0; index < count; index++)
         {
             dynamic item = items.Item(index);
-            string name = GetItemName(item);
+            bool isFolder = IsFolder(item);
+            // CopyHere writes the real file name, while Name can omit the extension when Explorer hides known
+            // extensions, so prefer the actual file name to keep the target path in sync with the copied file.
+            string name = isFolder ? GetItemName(item) : GetItemFileName(item);
             if (string.IsNullOrWhiteSpace(name))
             {
                 continue;
             }
 
-            string safeName = SanitizeSegment(name);
-            string[] childSegments = relativeSegments.Concat(new[] { safeName }).ToArray();
-            if (IsFolder(item))
+            string[] childSegments = [.. relativeSegments, SanitizeSegment(name)];
+            if (isFolder)
             {
                 object childFolder = item.GetFolder;
                 foreach (var child in EnumerateFiles(childFolder, childSegments))
@@ -183,7 +193,7 @@ public static class ShellSourceService
         return currentFolder;
     }
 
-    private static object CreateShellApplication()
+    public static object CreateShellApplication()
     {
         var shellType = Type.GetTypeFromProgID("Shell.Application")
             ?? throw new InvalidOperationException("Windows Shell integration is not available.");
@@ -211,8 +221,48 @@ public static class ShellSourceService
             return path;
         }
 
+        // Device folders have no file system path. Record every folder title up to This PC (for example
+        // "This PC\Nintendo Switch\Album") so ResolveByDisplayPath can find the folder again after a restart.
+        var titles = new List<string>();
+        dynamic? current = folder;
+        while (current is not null && titles.Count < MaximumFolderDepth)
+        {
+            string currentPath = TryGetFolderPath(current);
+            if (currentPath.Equals(ThisPcParsingPath, StringComparison.OrdinalIgnoreCase))
+            {
+                if (titles.Count > 0)
+                {
+                    return $"This PC\\{string.Join('\\', titles)}";
+                }
+
+                break;
+            }
+
+            string currentTitle = TryGetFolderTitle(current);
+            if (string.IsNullOrWhiteSpace(currentTitle))
+            {
+                break;
+            }
+
+            titles.Insert(0, currentTitle);
+            current = TryGetParentFolder(current);
+        }
+
+        // Not under This PC: fall back to the folder's own title.
         var title = TryGetFolderTitle(folder);
         return string.IsNullOrWhiteSpace(title) ? path : $"This PC\\{title}";
+    }
+
+    private static object? TryGetParentFolder(dynamic folder)
+    {
+        try
+        {
+            return folder.ParentFolder;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
     }
 
     private static string TryGetFolderTitle(dynamic folder)
@@ -237,6 +287,24 @@ public static class ShellSourceService
         {
             return "";
         }
+    }
+
+    private static string GetItemFileName(dynamic item)
+    {
+        try
+        {
+            string? fileName = item.ExtendedProperty("System.FileName") as string;
+            if (!string.IsNullOrWhiteSpace(fileName))
+            {
+                return fileName;
+            }
+        }
+        catch (Exception)
+        {
+            // Some namespaces do not expose System.FileName; fall back to the display name.
+        }
+
+        return GetItemName(item);
     }
 
     private static long? TryGetItemSize(dynamic item)
@@ -278,8 +346,18 @@ public static class ShellSourceService
 
     private static string SanitizeSegment(string segment)
     {
-        var invalidCharacters = Path.GetInvalidFileNameChars();
-        var cleaned = new string(segment.Select(character => invalidCharacters.Contains(character) ? '_' : character).ToArray()).Trim();
-        return string.IsNullOrWhiteSpace(cleaned) ? "_" : cleaned;
+        var cleaned = segment.AsSpan().ContainsAny(InvalidFileNameCharacters)
+            ? string.Create(segment.Length, segment, static (buffer, source) =>
+              {
+                  for (var index = 0; index < source.Length; index++)
+                  {
+                      buffer[index] = InvalidFileNameCharacters.Contains(source[index]) ? '_' : source[index];
+                  }
+              })
+            : segment;
+        cleaned = cleaned.Trim();
+
+        // "." and ".." contain no invalid characters but would escape the destination folder in Path.Combine.
+        return string.IsNullOrWhiteSpace(cleaned) || cleaned is "." or ".." ? "_" : cleaned;
     }
 }
