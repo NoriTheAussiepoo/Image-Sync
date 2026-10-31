@@ -57,4 +57,4 @@ dotnet run --project ImageSyncApp.RegressionTests\ImageSyncApp.RegressionTests.c
 
 Copyright 2026 Hazel Saliceta.
 
-This project is licensed under the PolyForm Noncommercial License 1.0.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+This project is licensed under the PolyForm Noncommercial License 1.0.0. See [LICENSE](LICENSE.md) and [NOTICE](NOTICE).
